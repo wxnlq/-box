@@ -105,6 +105,115 @@ async function signWbiParams(params) {
   return { ...sortedParams, w_rid };
 }
 
+function xmlEscape(value) {
+  return String(value ?? "")
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function cdata(value) {
+  return `<![CDATA[${String(value ?? "").replace(/\]\]>/g, "]]]]><![CDATA[>")}]]>`;
+}
+
+function dashBaseUrl(item) {
+  return item?.base_url || item?.baseUrl || "";
+}
+
+function selectBestDashVideo(videos = []) {
+  let targetVideos = videos.filter((v) => v.codecid === 7 || (v.codecs && v.codecs.startsWith("avc")));
+  if (targetVideos.length === 0) targetVideos = videos;
+
+  return [...targetVideos].sort((a, b) => {
+    if ((b.id || 0) !== (a.id || 0)) return (b.id || 0) - (a.id || 0);
+    if ((b.bandwidth || 0) !== (a.bandwidth || 0)) return (b.bandwidth || 0) - (a.bandwidth || 0);
+    return (b.width || 0) - (a.width || 0);
+  })[0];
+}
+
+function buildMpd(dash) {
+  const duration = Number(dash?.duration || 0);
+  const lines = [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    `<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" profiles="urn:mpeg:dash:profile:isoff-on-demand:2011" type="static" minBufferTime="PT1.5S" mediaPresentationDuration="PT${xmlEscape(duration)}S">`,
+    "  <Period>",
+  ];
+
+  const bestVideo = selectBestDashVideo(dash?.video || []);
+  const videos = bestVideo ? [bestVideo] : [];
+  if (videos.length) {
+    lines.push('    <AdaptationSet mimeType="video/mp4" contentType="video" subsegmentAlignment="true" subsegmentStartsWithSAP="1">');
+    for (const video of videos) {
+      lines.push(
+        `      <Representation id="${xmlEscape(video.id)}" codecs="${xmlEscape(video.codecs || "avc1.64001E")}" bandwidth="${xmlEscape(video.bandwidth || 0)}" width="${xmlEscape(video.width || 0)}" height="${xmlEscape(video.height || 0)}" frameRate="${xmlEscape(video.frame_rate || "")}">`,
+      );
+      lines.push(`        <BaseURL>${cdata(dashBaseUrl(video))}</BaseURL>`);
+      if (video.SegmentBase?.Initialization) {
+        lines.push(`        <SegmentBase indexRange="${xmlEscape(video.SegmentBase.indexRange || "")}">`);
+        lines.push(`          <Initialization range="${xmlEscape(video.SegmentBase.Initialization)}"/>`);
+        lines.push("        </SegmentBase>");
+      }
+      lines.push("      </Representation>");
+    }
+    lines.push("    </AdaptationSet>");
+  }
+
+  const audios = Array.isArray(dash?.audio) ? dash.audio : [];
+  if (audios.length) {
+    lines.push('    <AdaptationSet mimeType="audio/mp4" contentType="audio" subsegmentAlignment="true" subsegmentStartsWithSAP="1">');
+    for (const audio of audios) {
+      lines.push(
+        `      <Representation id="${xmlEscape(audio.id)}" codecs="${xmlEscape(audio.codecs || "mp4a.40.2")}" bandwidth="${xmlEscape(audio.bandwidth || 0)}">`,
+      );
+      lines.push(`        <BaseURL>${cdata(dashBaseUrl(audio))}</BaseURL>`);
+      if (audio.SegmentBase?.Initialization) {
+        lines.push(`        <SegmentBase indexRange="${xmlEscape(audio.SegmentBase.indexRange || "")}">`);
+        lines.push(`          <Initialization range="${xmlEscape(audio.SegmentBase.Initialization)}"/>`);
+        lines.push("        </SegmentBase>");
+      }
+      lines.push("      </Representation>");
+    }
+    lines.push("    </AdaptationSet>");
+  }
+
+  lines.push("  </Period>");
+  lines.push("</MPD>");
+  return lines.join("\n");
+}
+
+function getRuntimeContext(params = {}, context = {}) {
+  return context && Object.keys(context).length ? context : params?.context || {};
+}
+
+function buildDashProxyUrl(params = {}, context = {}, avid, cid) {
+  const ids = `${avid}_${cid}`;
+  const runtimeContext = getRuntimeContext(params, context);
+  const baseURL = String(runtimeContext?.baseURL || params?.baseURL || "").replace(/\/+$/, "");
+  const sourceId = String(runtimeContext?.sourceId || params?.sourceId || "");
+  const template = process.env.BILI_DASH_PROXY_URL || "";
+
+  if (template) {
+    return template
+      .replaceAll("{baseURL}", baseURL)
+      .replaceAll("{sourceId}", encodeURIComponent(sourceId))
+      .replaceAll("{ids}", encodeURIComponent(ids))
+      .replaceAll("{avid}", encodeURIComponent(avid))
+      .replaceAll("{cid}", encodeURIComponent(cid))
+      .replaceAll("{qn}", "127")
+      .replaceAll("{fnval}", "4048")
+      .replaceAll("{fourk}", "1");
+  }
+
+  return "";
+}
+
+function buildDashDataUrl(dash) {
+  const mpd = buildMpd(dash);
+  return `data:application/dash+xml;base64,${Buffer.from(mpd, "utf8").toString("base64")}`;
+}
+
 // ==================== 教育分类 ====================
 const CLASSES = [
   { type_id: "1年级语文", type_name: "1年级语文" },
@@ -339,7 +448,7 @@ async function detail(params) {
   }
 }
 
-async function play(params) {
+async function play(params, context = {}) {
   let playId = params.playId || "";
   const flag = params.flag || "";
 
@@ -360,6 +469,7 @@ async function play(params) {
   const avid = idParts[0];
   const cid = idParts[1];
   const loggedIn = isLoggedIn();
+  const dashProxyUrl = loggedIn ? buildDashProxyUrl(params, context, avid, cid) : "";
 
   const qualityList = loggedIn
     ? [127, 126, 125, 120, 116, 112, 80, 74, 64, 32, 16]
@@ -373,6 +483,18 @@ async function play(params) {
 
   const qualitySet = new Set();
   const availableQualities = [];
+  let dashProxyAdded = false;
+
+  if (dashProxyUrl) {
+    availableQualities.push({
+      name: "DASH(代理)",
+      url: dashProxyUrl,
+      qn: 1000,
+      isDashProxy: true,
+      audioUrl: "",
+    });
+    dashProxyAdded = true;
+  }
 
   for (const qn of qualityList) {
     const useDash = qn > 116;
@@ -397,6 +519,17 @@ async function play(params) {
       qualitySet.add(actualQn);
 
       if (payload.dash?.video?.length) {
+        if (loggedIn && !dashProxyAdded) {
+          availableQualities.push({
+            name: "DASH(代理)",
+            url: buildDashDataUrl(payload.dash),
+            qn: 1000,
+            isDashProxy: true,
+            audioUrl: "",
+          });
+          dashProxyAdded = true;
+        }
+
         const bestVideo = [...payload.dash.video].sort((a, b) => {
           if ((b.id || 0) !== (a.id || 0)) return (b.id || 0) - (a.id || 0);
           if ((b.bandwidth || 0) !== (a.bandwidth || 0)) return (b.bandwidth || 0) - (a.bandwidth || 0);
@@ -461,12 +594,50 @@ async function play(params) {
   return response;
 }
 
+async function proxy(params = {}) {
+  const ids = params.ids || params.playId || params.id || "";
+  const idParts = String(ids).split("_");
+  if (idParts.length < 2) return "";
+
+  const avid = idParts[0];
+  const cid = idParts[1];
+  const qn = parseInt(params.qn, 10) || 127;
+  const headers = {
+    ...BILI_HEADERS,
+    Referer: `https://www.bilibili.com/video/av${avid}`,
+    Origin: "https://www.bilibili.com",
+  };
+
+  try {
+    const { data } = await axios.get("https://api.bilibili.com/x/player/playurl", {
+      headers,
+      params: {
+        avid,
+        cid,
+        qn,
+        fnval: parseInt(params.fnval, 10) || 4048,
+        fourk: params.fourk == null ? 1 : params.fourk,
+        ...(!isLoggedIn() ? { try_look: 1 } : {}),
+      },
+    });
+
+    if (data?.code === 0 && data?.data?.dash) {
+      return buildMpd(data.data.dash);
+    }
+    return "";
+  } catch (error) {
+    logError("DASH代理获取失败", error);
+    return "";
+  }
+}
+
 module.exports = {
   home,
   category,
   search,
   detail,
   play,
+  proxy,
 };
 
 const runner = require("spider_runner");

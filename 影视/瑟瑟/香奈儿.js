@@ -1,51 +1,22 @@
-// @name 采集站模板
+// @name 采集站模板-自动解析视频type生成分类
+// @downloadURL https://gh-proxy.org/https://github.com/Silent1566/OmniBox-Spider/raw/refs/heads/main/模板/JavaScript/采集站模板.js
 /**
  * OmniBox 采集站直接爬虫脚本
- *
- * 此脚本直接调用采集站接口获取数据，参考 OmniBox 后端实现逻辑
- * 只需要配置采集站的 API 地址即可使用
- *
- * 配置说明：
- * 1. 在 OmniBox 后台添加采集站，获取采集站的 API 地址
- * 2. 将 API 地址配置到环境变量 SITE_API 中，或直接修改下面的 SITE_API 常量
- * 3. （可选）配置弹幕 API 地址到环境变量 DANMU_API 中，或直接修改下面的 DANMU_API 常量
- *    弹幕 API 地址示例：https://danmu.example.com
- *
- * 采集站接口规范（参考 OmniBox 后端实现）：
- * - 首页：GET {API}?ac=list&pg={page}
- * - 分类：GET {API}?ac=class
- * - 分类列表：GET {API}?ac=videolist&t={typeId}&pg={page}
- * - 搜索：GET {API}?ac=list&wd={keyword}&pg={page}
- * - 详情：GET {API}?ac=detail&ids={videoId}
- *
- * 响应格式：
- * {
- *   "page": 1,
- *   "pagecount": 10,
- *   "total": 100,
- *   "list": [...],
- *   "class": [...]
- * }
- *
- * 使用方法：
- * 1. 在 OmniBox 后台创建爬虫源，选择 JavaScript 类型
- * 2. 复制此脚本内容到爬虫源编辑器
- * 3. 配置环境变量 SITE_API 为采集站的 API 地址
- * 4. 保存并测试
+ * 修改说明：
+ * 1. 不再请求ac=class远程分类接口，从ac=list返回的视频json自动提取type_id、type_name生成分类
+ * 2. 视频type_name为空时，分类名称使用type_id填充
+ * 3. 保留原生采集站列表接口逻辑，无需手动填写视频ID
  */
 
 const OmniBox = require("omnibox_sdk");
 
 // ==================== 配置区域 ====================
 // 采集站 API 地址（优先使用环境变量，如果没有则使用默认值）
-// 例如：https://example.com/api.php/provide/vod/
 const SITE_API = process.env.SITE_API || "https://www.gdlsp.com/api/json.php";
 
 // 弹幕 API 地址（优先使用环境变量，如果没有则使用默认值）
-// 例如：https://danmu.example.com
 // 如果为空，则不启用弹幕功能
 const DANMU_API = process.env.DANMU_API || "";
-
 // ==================== 配置区域结束 ====================
 
 /**
@@ -105,6 +76,30 @@ function toInt(value) {
 }
 
 /**
+ * 从视频列表自动生成分类，无type_name则使用type_id作为名称
+ * @param {Array} videoList 接口返回的原始视频数组
+ * @returns {Array} 标准分类数组
+ */
+function buildAutoClassFromVideos(videoList) {
+  if (!Array.isArray(videoList)) return [];
+  const typeMap = new Map();
+  videoList.forEach(item => {
+    const tid = String(item.type_id || item.TypeID || "");
+    let tname = String(item.type_name || item.TypeName || "").trim();
+    // 名称为空则用ID代替
+    if (!tname) tname = tid;
+    if (tid && !typeMap.has(tid)) {
+      typeMap.set(tid, {
+        type_id: tid,
+        type_pid: "0",
+        type_name: tname
+      });
+    }
+  });
+  return Array.from(typeMap.values());
+}
+
+/**
  * 格式化视频数据
  * @param {Array} list - 原始视频列表
  * @returns {Array} 格式化后的视频列表
@@ -124,24 +119,19 @@ function formatVideos(list) {
       let vodPlayFrom = String(item.vod_play_from || item.VodPlayFrom || "");
 
       // 处理多线路播放源：如果包含 $$$ 分割符，将每个线路名称与 vod_id 用 - 连接
-      // 例如：vod_play_from = "rym3u8$$$ruyi", vod_id = "68368"
-      // 结果：vod_play_from = "rym3u8-68368$$$ruyi-68368"
       if (vodPlayFrom && vodId && vodPlayFrom.includes("$$$")) {
         const lines = vodPlayFrom.split("$$$");
         const processedLines = lines
           .map((line) => {
             const trimmedLine = line.trim();
             if (trimmedLine) {
-              // 如果线路名称已经包含 - 和数字（可能是之前处理过的），先提取原始线路名
-              // 否则直接拼接
               return `${trimmedLine}-${vodId}`;
             }
             return trimmedLine;
           })
-          .filter((line) => line); // 过滤空字符串
+          .filter((line) => line);
         vodPlayFrom = processedLines.join("$$$");
       } else if (vodPlayFrom && vodId) {
-        // 单线路，也添加 -vod_id
         vodPlayFrom = `${vodPlayFrom}-${vodId}`;
       }
 
@@ -213,7 +203,7 @@ function convertToPlaySources(vodPlayFrom, vodPlayUrl, vodId) {
         const parts = segment.split("$");
         if (parts.length >= 2) {
           const episodeName = parts[0].trim();
-          const playId = parts.slice(1).join("$").trim(); // 支持播放地址中包含 $ 的情况
+          const playId = parts.slice(1).join("$").trim();
 
           if (episodeName && playId) {
             episodes.push({
@@ -263,24 +253,19 @@ function formatDetailVideos(list) {
       let vodPlayFrom = String(item.vod_play_from || item.VodPlayFrom || "");
 
       // 处理多线路播放源：如果包含 $$$ 分割符，将每个线路名称与 vod_id 用 - 连接
-      // 例如：vod_play_from = "rym3u8$$$ruyi", vod_id = "68368"
-      // 结果：vod_play_from = "rym3u8-68368$$$ruyi-68368"
       if (vodPlayFrom && vodId && vodPlayFrom.includes("$$$")) {
         const lines = vodPlayFrom.split("$$$");
         const processedLines = lines
           .map((line) => {
             const trimmedLine = line.trim();
             if (trimmedLine) {
-              // 如果线路名称已经包含 - 和数字（可能是之前处理过的），先提取原始线路名
-              // 否则直接拼接
               return `${trimmedLine}-${vodId}`;
             }
             return trimmedLine;
           })
-          .filter((line) => line); // 过滤空字符串
+          .filter((line) => line);
         vodPlayFrom = processedLines.join("$$$");
       } else if (vodPlayFrom && vodId) {
-        // 单线路，也添加 -vod_id
         vodPlayFrom = `${vodPlayFrom}-${vodId}`;
       }
 
@@ -294,6 +279,7 @@ function formatDetailVideos(list) {
         vod_name: String(item.vod_name || item.VodName || ""),
         vod_pic: String(item.vod_pic || item.VodPic || ""),
         type_name: String(item.type_name || item.TypeName || ""),
+        type_id: String(item.type_id || item.TypeID || ""),
         vod_year: String(item.vod_year || item.VodYear || ""),
         vod_area: String(item.vod_area || item.VodArea || ""),
         vod_remarks: String(item.vod_remarks || item.VodRemarks || ""),
@@ -308,41 +294,10 @@ function formatDetailVideos(list) {
 }
 
 /**
- * 格式化分类数据
- * @param {Array} classes - 原始分类列表
- * @returns {Array} 格式化后的分类列表
+ * 格式化分类数据（原版废弃，不再使用ac=class接口）
  */
 function formatClasses(classes) {
-  if (!Array.isArray(classes)) {
-    return [];
-  }
-
-  const seen = new Set();
-  const result = [];
-
-  for (const cls of classes) {
-    if (typeof cls !== "object" || cls === null) {
-      continue;
-    }
-
-    const typeId = String(cls.type_id || cls.TypeID || "");
-    const typePid = String(cls.type_pid || cls.TypePID || "");
-    const typeName = String(cls.type_name || cls.TypeName || "").trim();
-
-    // 去重
-    if (!typeId || seen.has(typeId)) {
-      continue;
-    }
-    seen.add(typeId);
-
-    result.push({
-      type_id: typeId,
-      type_pid: typePid,
-      type_name: typeName,
-    });
-  }
-
-  return result;
+  return [];
 }
 
 /**
@@ -448,7 +403,6 @@ module.exports = {
 };
 
 // 使用公共 runner 处理标准输入/输出
-// runner 通过 NODE_PATH 环境变量自动解析，无需手动指定路径
 const runner = require("spider_runner");
 runner.run(module.exports);
 
@@ -463,26 +417,14 @@ async function home(params) {
 
     const page = params.page || "1";
 
-    // 首先尝试获取首页数据（包含分类和视频列表）
-    let response = await requestSiteAPI({
+    // 请求首页列表接口获取全部视频数据，用于自动生成分类
+    const response = await requestSiteAPI({
       ac: "list",
       pg: page,
     });
 
-    // 如果没有分类数据，尝试单独获取分类
-    if (!response.class || (Array.isArray(response.class) && response.class.length === 0)) {
-      try {
-        const classResponse = await requestSiteAPI({ ac: "class" });
-        if (classResponse.class) {
-          response.class = classResponse.class;
-        }
-      } catch (error) {
-        OmniBox.log("warn", `获取分类失败: ${error.message}`);
-      }
-    }
-
-    // 格式化分类数据
-    const classes = formatClasses(response.class || []);
+    // 自动从当前页视频生成分类，不再请求ac=class
+    const classes = buildAutoClassFromVideos(response.list || []);
 
     // 格式化视频列表
     let videos = formatVideos(response.list || []);
@@ -811,13 +753,11 @@ async function play(params) {
     }
 
     // 从flag中解析视频ID
-    // flag格式：rym3u8-68368 或 68368
     const videoId = extractVideoIdFromFlag(flag);
 
     OmniBox.log("info", `获取播放地址: playId=${playId}, flag=${flag}, videoId=${videoId}`);
 
     // 构建播放地址响应
-    // 统一使用数组格式，每个元素包含 name 和 url，类似 danmaku 格式
     let urlsResult = [
       {
         name: "播放",
@@ -825,8 +765,7 @@ async function play(params) {
       },
     ];
 
-    let parse = 1; // 默认需要解析
-    // 如果是直接的 m3u8 或 mp4 链接，不需要解析
+    let parse = 1;
     if (/\.(m3u8|mp4)$/.test(playId)) {
       parse = 0;
     }
@@ -843,7 +782,6 @@ async function play(params) {
       let fileName = "";
 
       try {
-        // 使用视频ID获取详情
         const detailResponse = await requestSiteAPI({
           ac: "detail",
           ids: videoId,
@@ -855,16 +793,11 @@ async function play(params) {
           const playURL = video.vod_play_url || video.VodPlayURL || "";
 
           if (videoName && playURL) {
-            // 解析播放URL，查找当前播放地址对应的集数
-            // 播放URL格式：HD中字$https://...$$$HD中字$https://...
-            // 或者：HD中字$https://...#HD中字$https://...
             const segments = playURL.split("#").filter((s) => s.trim());
 
-            // 如果只有一集，视为电影，直接用片名匹配
             if (segments.length === 1) {
               fileName = videoName;
             } else {
-              // 多集剧集，查找当前播放地址对应的集数
               let epNum = 0;
               for (let idx = 0; idx < segments.length; idx++) {
                 const seg = segments[idx];
@@ -873,9 +806,7 @@ async function play(params) {
                   const epLabel = parts[0].trim();
                   const epURL = parts[1].trim();
 
-                  // 匹配当前播放地址
                   if (epURL === playId || epURL.includes(playId) || playId.includes(epURL)) {
-                    // 尝试从标签中提取集数
                     const digits = extractDigits(epLabel);
                     if (digits) {
                       epNum = parseInt(digits, 10);
@@ -888,14 +819,12 @@ async function play(params) {
               }
 
               if (epNum > 0) {
-                // 构建文件名：视频名 S01E01
                 if (epNum < 10) {
                   fileName = `${videoName} S01E0${epNum}`;
                 } else {
                   fileName = `${videoName} S01E${epNum}`;
                 }
               } else {
-                // 如果无法匹配集数，使用视频名称（可能是电影）
                 fileName = videoName;
               }
             }
@@ -905,12 +834,10 @@ async function play(params) {
         OmniBox.log("warn", `获取详情失败，无法推断集数: ${error.message}`);
       }
 
-      // 如果无法从详情获取文件名，尝试从URL推断
       if (!fileName) {
         fileName = inferFileNameFromURL(playId);
       }
 
-      // 匹配弹幕
       if (fileName) {
         const danmakuList = await matchDanmu(fileName);
         if (danmakuList.length > 0) {
